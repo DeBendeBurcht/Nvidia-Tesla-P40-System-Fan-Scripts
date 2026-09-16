@@ -46,7 +46,7 @@ SERIAL="/dev/ttyS0"
 INTERVAL_SEC=2                    # Heartbeat interval (host timeout is 8s)
 
 # --- PWM Boundaries ---
-PWM_MIN=40                        # Host clamps here to protect fan bearing
+PWM_MIN=20                        # Host clamps here to protect fan bearing
 PWM_MAX=254                       # Maximum normal speed
 PWM_EMERGENCY=255                 # 255 triggers a hypervisor emergency stop
 PWM_QUERY_FAIL=180                # Safe fallback if nvidia-smi fails
