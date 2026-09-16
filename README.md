@@ -1,119 +1,228 @@
-# Nvidia-Tesla-P40-System-Fan-Scripts
-Scripts to allow a (power injected) 9377 fan to be controlled from inside a linux vm through proxmox into the motherboards header
+# 🌀 Nvidia Tesla P40 — System Fan Scripts
 
+Control a **power-injected 9377 blower** (e.g. Delta BFB1012EH) from inside a Linux VM, through Proxmox, onto a motherboard `SYS_FAN` header.
 
-# Proxmox / KVM GPU Fan Controller for NVIDIA Tesla P40
-
-An enterprise-grade, automated cooling bridge designed to control host-managed motherboard chassis fans (`SYS_FAN`) based on real-time GPU metrics inside a KVM/QEMU Guest Virtual Machine (VM). 
-
-This architecture explicitly solves the cooling challenges of the **NVIDIA Tesla P40** (and similar passive enterprise accelerators) when equipped with custom blower shrouds (e.g., Delta BFB1012EH) connected to a motherboard fan header rather than a native GPU fan controller.
+Built for a **pasthrough NVIDIA Tesla P40 24GB** with a custom low-restriction shroud. Tuned and verified on **Proxmox VE** + **Debian 12**. The same ideas may work on other KVM setups with minor path tweaks.
 
 ---
 
-## ⚡ Key Features
-
-* **Proactive Load Anti-Lag (Predictive Control):** Spins up the high-static pressure blower the moment GPU execution starts or high wattage draw occurs, instead of waiting for the copper heatsink block to become thermally saturated.
-* **Smart Hysteresis & Decay Dampening:** Prevents the blower from generating annoying rapid auditory "pulsing" by caching target RPM jumps and applying strict acceleration/deceleration rate-limiting (`UP_STEP` / `DOWN_STEP`).
-* **Kernel & Infrastructure Safety Failsafes:**
-  * **Host Fallback:** If the guest VM crashes, reboots, or drops communication for $>8$ seconds, the host daemon instantly locks the fan to a safe high-throughput velocity (`PWM 180`).
-  * **Thermal Emergency:** If the guest registers a critical thermal runaway condition ($\ge 87^\circ\text{C}$), it transmits an emergency burst (`PWM 255`) prompting host notification workflows.
-* **Isolated Environment Footprint:** Runs independently of system-wide networking infrastructure using isolated UNIX domain sockets over QEMU serial pipelines. It avoids tampering with system-wide configuration layers (`update-alternatives`).
+> ⚠️ **Heads-up**  
+> This repository was written with the help of AI. It is **not actively maintained**.  
+> There is no support channel, no guaranteed compatibility matrix, and no promise that a future Proxmox / kernel / nvidia update will keep working without changes.  
+>  
+> That said — I'm proud of what this does on my box. Use it, fork it, break it, fix it. You own the risk on your own hardware.
 
 ---
 
-## 🏗️ System Architecture
+## 🚨 Critical warnings (read before you touch hardware)
+
+### 1. Set a **flat** BIOS fan curve first
+If the host script is stopped, crashed, or not started yet, the motherboard reclaims the header. A normal BIOS “smart” curve will fight your last PWM write and can produce wild RPM swings.
+
+**Do this in UEFI/BIOS before relying on the daemon:**
+
+- Open the fan / hardware monitor page for the header you will use (`SYS_FAN2` in this project).
+- Set a **flat fixed percentage** curve — not temperature-linked steps.  
+  Example that works here: **20%** steady.
+- Save and exit.
+
+That way “script not running” = quiet, predictable airflow, not a roulette wheel.
+
+### 2. Pick the **correct** fan header — wrong header can brick your calm
+The host script writes directly to `pwmN` on the Super I/O chip (IT8689 via `it87`).
+
+| Wrong move | What happens |
+|---|---|
+| `FAN_HEADER` points at CPU_FAN / a different SYS_FAN | You fight the BIOS or another controller on that channel |
+| Two writers on the same `pwmN` (BIOS auto + script, or two scripts) | **Race condition** on the register — RPM hunting, odd ACPI behaviour, in the worst case a hard lock / crash loop |
+| Power-injected blower on a header the board still tries to “sense” oddly | Noise, false tach, or surprise full speed |
+
+**Checklist before `systemctl enable`:**
+
+1. Physically plug the **BFB1012EH** (4-pin, molex +12V inject on the positive line — you already know that wiring is on you) into the intended header.
+2. Confirm with `sensors` / sysfs which `hwmon*/pwmN` and `fanN_input` move when you twiddle that header.
+3. Set `FAN_HEADER=N` in `gpu-fan-controller.sh` to **that** N only.
+4. Do **not** leave the BIOS in “Smart” / “PWM auto” for that same header while the daemon owns it — use the flat % fallback from warning 1, and let the script switch `pwmN_enable` to manual while it runs.
+
+### 3. Serial0 is exclusive
+Guest talks to the host over QEMU `serial0` → guest `/dev/ttyS0`.
+
+- Do **not** run `qm terminal <VMID>` on that serial while the fan bridge is up.
+- Only **one** socket client at a time.
+
+### 4. Guest “255” is a panic button
+Host treats sustained **PWM 255** as “cooling failed → stop the VM”.  
+Guest normal ceiling is **254**. Do not map a casual full-fan curve to 255.
+
+---
+
+## ✨ What this does
+
+| Layer | Script | Job |
+|---|---|---|
+| **Proxmox host** | `gpu-fan-controller.sh` | Owns `SYS_FAN` via `it87`, reads PWM integers from the VM serial socket, applies hysteresis / heat-soak / fail-safes, writes sysfs |
+| **Debian guest** | `gpu-fan-guest.sh` | Reads Tesla P40 die (and memory temp if the driver exposes it), util & power via `nvidia-smi`, runs a quiet fan curve + light prediction, heartbeats ASCII PWM lines to `/dev/ttyS0` |
+
+### Goals on this machine
+- Keep the **P40 stable and safe** under load  
+- Keep the **server as silent as possible** at idle  
+- Survive **VM crash / serial drop / script restart** without cooking the card or fighting the BIOS for minutes  
+
+### Built-in safety (host)
+| Event | Response |
+|---|---|
+| Guest silent ≥ **8s** (crash, hang, reboot) | Force **PWM 180** |
+| VM offline | Idle **PWM 40**, then after **5 min** return header to **BIOS** |
+| High duty then sudden drop | **Heat-soak** hold (~25s) so the heatsink can dump residual heat |
+| Guest sends **255** for ~30s | `qm stop <VMID> --skiplock` |
+| systemd restart while VM still up | Stay in **manual** at 180 — no 2s dive into the BIOS curve under a live P40 |
+
+### Guest curve behaviour (defaults)
+| State | Approx PWM |
+|---|---|
+| Idle ~40–50°C | 40–44 (near silent) |
+| Light work ~60°C | ~78 |
+| Real load ~70–75°C | ~145–180 |
+| Hot ~84°C | ~240 |
+| Normal max | **254** |
+| Die ≥88°C held critical | **255** (host stop path) |
+
+Light **prediction**: extra PWM when temperature is rising, SM util is already high while the die is still cool, or power draw is already elevated — so the 9377 leads the copper instead of chasing it. Asymmetric slew (`UP_STEP` / `DOWN_STEP`) stops the blower from yoyoing audibly.
+
+---
+
+## 🏗️ Architecture
 
 ```text
-┌────────────────────────────────────────────────────────┐
-│  Proxmox VE (Host Layer)                               │
-│                                                        │
-│  [it87 Driver] ──> /sys/class/hwmon/hwmon3/pwm2        │
-│                           ▲                            │
-│               (gpu-fan-controller.sh)                  │
-│                           ▲                            │
-│              Reads from UNIX Domain Socket             │
-└───────────────────────────┼────────────────────────────┘
-                            │
-                            │ QEMU VirtIO Serial0
-                            ▼
-┌────────────────────────────────────────────────────────┐
-│  Debian 12 Guest (VM 126)                              │
-│                                                        │
-│  [nvidia-smi] ──> Queries Die Temp, Util & Power       │
-│                           │                            │
-│                  (gpu-fan-guest.sh)                    │
-│                           │                            │
-│              Writes to Pipeline /dev/ttyS0             │
-└────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│  Proxmox VE host                                           │
+│                                                            │
+│  it87  →  /sys/class/hwmon/hwmonX/pwmN   (SYS_FAN header)  │
+│                    ▲                                       │
+│         gpu-fan-controller.sh                              │
+│                    ▲                                       │
+│         UNIX socket  /var/run/qemu-server/<VMID>.serial0   │
+└────────────────────┼───────────────────────────────────────┘
+                     │  QEMU serial0 (socket)
+                     ▼
+┌────────────────────────────────────────────────────────────┐
+│  Debian 12 guest  (e.g. VM 126)                            │
+│                                                            │
+│  nvidia-smi  →  die °C · (mem °C) · util · power           │
+│                    │                                       │
+│         gpu-fan-guest.sh                                   │
+│                    │                                       │
+│         /dev/ttyS0   ASCII integer + newline, ≤8s heartbeat│
+└────────────────────────────────────────────────────────────┘
 ```
+
+**Fan path (physical):** Tesla P40 → custom shroud → Delta **BFB1012EH** (4-pin) → molex **+12V power inject** on the positive rail → motherboard **SYS_FAN** header (tach + PWM from the board, power from the PSU inject).
 
 ---
 
 ## 📦 Prerequisites
 
-### Host Environment (Proxmox VE)
-* **Kernel Compatibility:** Fully verified on kernel `6.8.4-2-pve`.
-* **Required Packages:** Linux header files for the current booted kernel must be present to build the hardware monitoring driver.
+### Host (Proxmox VE)
+- Working Proxmox install (verified idea on kernel family `6.8.x-pve`; yours may differ)
+- Motherboard Super I/O supported by Frank Crawford’s **it87** DKMS (here: **IT8689** on a Gigabyte A520M-class board)
+- Packages: kernel headers for the **running** kernel, `dkms`, `git`, `build-essential`, `lm-sensors`, **`netcat-openbsd`**
+- Flat BIOS % on the target header (see warnings)
 
-### Guest Environment (VM)
-* **OS:** Debian 12 (or similar modern Linux distribution).
-* **GPU Configuration:** NVIDIA Proprietary Datacenter Drivers (v535+) installed with active PCI-passthrough topology successfully configured.
+### Guest (Debian 12 VM)
+- GPU **PCI passthrough** of the Tesla P40 working
+- NVIDIA proprietary driver **535+** (`nvidia-driver`, `nvidia-smi` OK)
+- `serial0: socket` on the VM config → `/dev/ttyS0` inside the guest
+
+### Hardware notes
+- **9377-size blower**, model used here: **BFB1012EH**
+- Header-driven PWM + separate **power inject** (board header alone usually cannot feed this blower’s current)
+- You are responsible for inject polarity, wire gauge, and not back-feeding the motherboard rail
 
 ---
 
-## 🚀 Step-by-Step Installation
+## 🚀 Installation
 
-### Part 1: Proxmox Host Configuration
+### Part 1 — Proxmox host
 
-#### 1. Install Kernel Headers and Building Tools
-To ensure compliance with pinned or rolled-back kernels without forcing unwanted system upgrades, target your running kernel layout:
+#### 1️⃣ Kernel headers & tools
+Pin to the kernel you are **actually booted on** (avoids pulling a newer headers package than your running image):
+
 ```bash
 apt update
 apt install -y pve-headers-$(uname -r) build-essential git dkms lm-sensors netcat-openbsd
 ```
 
-#### 2. Deploy Frank Crawford's `it87` Driver via DKMS
+#### 2️⃣ Frank Crawford `it87` via DKMS
 ```bash
 cd /usr/src
-git clone https://github.com
+git clone https://github.com/frankcrawford/it87.git
 cd it87
 
-# If recovery from a prior interrupted kernel migration is required, clear records:
-dkms remove it87/v2.0-4-gbc06d34.20260913 --all 2>/dev/null || true
+# Only if a broken half-install exists from an old kernel:
+# dkms remove it87/<old-version> --all 2>/dev/null || true
 
-# Register, build, and deploy the driver
-dkms add .
-dkms install it87/v2.0-4-gbc06d34.20260913
+./dkms-install.sh
+# or: dkms add . && dkms install it87/<version-shown-by-dkms>
 ```
 
-#### 3. Establish the Gigabyte ACPI Workaround
-Create persistent runtime module arguments to resolve common hardware resource ownership contentions between the Linux driver and UEFI ACPI instructions:
+#### 3️⃣ Persist the Gigabyte ACPI workaround (**both** files)
+`modules-load.d` only takes the **module name**. Parameters belong in `modprobe.d`.
+
 ```bash
 echo "it87" > /etc/modules-load.d/it87.conf
 echo "options it87 ignore_resource_conflict=1" > /etc/modprobe.d/it87.conf
-
-# Commit changes and force immediate insertion
-modprobe it87
+modprobe it87 ignore_resource_conflict=1
 ```
 
-#### 4. Configure the QEMU Serial Interface
-Bind a virtual UNIX stream server instance to VM 126. Run this command on your Proxmox terminal:
+Confirm after reboot:
+
 ```bash
-qm set 126 --serial0 socket
+cat /sys/module/it87/parameters/ignore_resource_conflict   # expect Y or 1
+lsmod | grep it87
+sensors
 ```
 
-#### 5. Install the Host-Side Daemon
-Place the script text into `/usr/local/bin/gpu-fan-controller.sh`. Give it executable permissions:
+#### 4️⃣ Find **your** fan header (do not skip)
 ```bash
-chmod +x /usr/local/bin/gpu-fan-controller.sh
+# List chips / fans
+sensors
+
+# See which hwmon node is the IT8689 and which pwm/fan indices exist
+grep -H . /sys/class/hwmon/hwmon*/name
+ls /sys/class/hwmon/hwmon*/pwm* /sys/class/hwmon/hwmon*/fan*_input 2>/dev/null
 ```
 
-#### 6. Register and Activate the Host Service
-Create a dedicated background management system definition:
+Spin or stop the physical blower briefly (or watch RPM while changing BIOS % on one header only) until you know:
+
+- `hwmon` path  
+- `pwmN` / `fanN_input` index  
+
+Set that index as `FAN_HEADER` in the host script. **Wrong N = race with something else on the board.**
+
+#### 5️⃣ Attach QEMU serial0 to the GPU VM
 ```bash
-nano /etc/systemd/system/gpu-fan-controller.service
+qm set <VMID> --serial0 socket
+# example: qm set 126 --serial0 socket
+qm config <VMID> | grep serial0
 ```
-Paste the following definition:
+
+#### 6️⃣ Install the host daemon
+Copy `gpu-fan-controller.sh` to the host and adjust at least:
+
+| Variable | Meaning | Example |
+|---|---|---|
+| `FAN_HEADER` | Motherboard header index (`pwmN`) | `2` |
+| `VM_ID` | Proxmox VM id with the P40 | `126` |
+| `PWM_IDLE` / `PWM_MIN` | Quiet floor while script owns the fan | `40` |
+| `PWM_SAFE_FALLBACK` | Serial silence / takeover | `180` |
+
+```bash
+install -m 755 gpu-fan-controller.sh /usr/local/bin/gpu-fan-controller.sh
+```
+
+#### 7️⃣ systemd unit (host)
+`/etc/systemd/system/gpu-fan-controller.service`:
+
 ```ini
 [Unit]
 Description=Proxmox Host SYS_FAN GPU Controller
@@ -131,39 +240,55 @@ StartLimitBurst=8
 [Install]
 WantedBy=multi-user.target
 ```
-Initialize and start the service:
+
 ```bash
 systemctl daemon-reload
 systemctl enable --now gpu-fan-controller.service
+journalctl -u gpu-fan-controller.service -f
+```
+
+Useful one-shot:
+
+```bash
+gpu-fan-controller.sh --status
 ```
 
 ---
 
-### Part 2: Guest VM Configuration
+### Part 2 — Debian guest (P40 VM)
 
-SSH into the Guest VM (with ID 126) and execute commands utilizing administrative permissions (`sudo`):
-
-#### 1. Verify Serial Link Device Node
-Confirm that your virtual serial interface mapping is exposed by KVM:
+#### 1️⃣ Serial node
 ```bash
 ls -l /dev/ttyS0
 ```
 
-#### 2. Install the Guest Script
-Deploy the script text into `/usr/local/bin/gpu-fan-guest.sh` and make it executable:
+#### 2️⃣ NVIDIA stack
 ```bash
-sudo chmod +x /usr/local/bin/gpu-fan-guest.sh
+sudo apt install -y nvidia-driver nvidia-kernel-dkms
+nvidia-smi
+nvidia-smi --query-gpu=temperature.gpu,temperature.memory,utilization.gpu,power.draw --format=csv,noheader
 ```
 
-#### 3. Register the Guest Service Container
+Die temperature should be a number. **Memory temp on P40 + 535 is often `[N/A]`** — the guest script treats that as optional and ignores it when missing.
+
+#### 3️⃣ Install the guest reporter
+Copy `gpu-fan-guest.sh`, then:
+
 ```bash
-sudo nano /etc/systemd/system/gpu-fan-guest.service
+sudo install -m 755 gpu-fan-guest.sh /usr/local/bin/gpu-fan-guest.sh
 ```
-Paste the configuration:
+
+Tune `GPU_T` / `GPU_P` (and optional `MEM_*`) if your shroud/ambient needs a quieter or colder curve. Leave **254** as the normal max unless you intend to trip the host emergency path.
+
+#### 4️⃣ systemd unit (guest)
+`/etc/systemd/system/gpu-fan-guest.service`:
+
 ```ini
 [Unit]
 Description=Tesla P40 Guest Fan Reporter
-After=network.target
+After=multi-user.target
+# Optional if you use it:
+# Wants=nvidia-persistenced.service
 
 [Service]
 Type=simple
@@ -174,73 +299,135 @@ RestartSec=2s
 [Install]
 WantedBy=multi-user.target
 ```
-Commit changes to systemd and spin up the daemon pipeline:
+
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now gpu-fan-guest.service
+sudo systemctl status gpu-fan-guest.service
+sudo journalctl -u gpu-fan-guest.service -f
+```
+
+Guest status file (when running):
+
+```bash
+gpu-fan-guest.sh --status
+# or: cat /dev/shm/gpu-fan-guest-state
 ```
 
 ---
 
-## 🔍 Validation and Verification
+## ✅ Validation checklist
 
-Follow these verification pipelines to confirm that communication, logic, and physical fan control are functioning perfectly.
-
-### Phase 1: Verify Hardware Module Tracking
-On the Proxmox Host, execute an introspection call to confirm the kernel driver has locked target device registries:
+### 1. Host driver & header
 ```bash
 lsmod | grep it87
+cat /sys/module/it87/parameters/ignore_resource_conflict
+# Write a test value ONLY to the header you identified:
+# echo 80 > /sys/class/hwmon/hwmonX/pwmN_enable   # 1 = manual
+# echo 100 > /sys/class/hwmon/hwmonX/pwmN
+# cat /sys/class/hwmon/hwmonX/fanN_input
 ```
-*Expected Output:* An active pointer structure listing references showing `it87`.
+Expect RPM to move on **that** blower only.
 
-### Phase 2: Interrogate Guest VM Datastream Transmission
-Inspect the system logs inside the VM to track live telemetry acquisition and serialization routines:
+### 2. Guest is transmitting
 ```bash
-sudo systemctl status gpu-fan-guest.service
+sudo journalctl -u gpu-fan-guest.service -n 30 --no-pager
 ```
-*Expected Output:*
-```text
-● gpu-fan-guest.service - Tesla P40 Guest Fan Reporter
-   Active: active (running) since Wed 2026-09-16 20:42:40 CEST; 5s ago
-...
-[2026-09-16 20:59:32] GPU: 32°C | Core Util: 0% | Power Draw: 9W | Outbound PWM: 40
-```
+Expect lines with GPU °C, util, power, and outbound PWM. Heartbeat about every **2s**.
 
-### Phase 3: Monitor Real-Time Host Execution Logs
-Track how the Proxmox hypervisor layer captures incoming IPC frames and handles hardware changes:
+### 3. Host is applying
 ```bash
 journalctl -u gpu-fan-controller.service -f
+gpu-fan-controller.sh --status
 ```
-*Expected Output during normal execution:*
+Expect `ACTIVE`, PWM matching the guest (subject to hysteresis / heat-soak), non-zero RPM.
+
+### 4. Forced ramp (acoustic test)
+On the **guest**, temporarily raise the floor, then put it back:
+
+```bash
+sudo sed -i 's/^PWM_MIN=40/PWM_MIN=160/' /usr/local/bin/gpu-fan-guest.sh
+sudo systemctl restart gpu-fan-guest.service
+# blower should climb; host journal shows higher PWM / RPM
+sudo sed -i 's/^PWM_MIN=160/PWM_MIN=40/' /usr/local/bin/gpu-fan-guest.sh
+sudo systemctl restart gpu-fan-guest.service
+```
+After the drop, host **heat-soak** may hold an elevated duty ~25s — that is intentional.
+
+### 5. Fail-safe smoke tests (careful)
+| Test | Expect |
+|---|---|
+| `systemctl stop gpu-fan-guest` for >8s | Host → PWM **180** |
+| Clean VM shutdown | Host → idle **40**, later BIOS after timeout |
+| Stop host daemon with VM still up | Cleanup holds **180 manual** (not a surprise BIOS dip) |
+
+---
+
+## 🔧 Configuration map
+
+### Host (`gpu-fan-controller.sh`)
+| Knob | Role |
+|---|---|
+| `FAN_HEADER` | Sysfs `pwmN` / `fanN` index — **must match the physical header** |
+| `VM_ID` | Proxmox VM id → `…/qemu-server/${VM_ID}.serial0` |
+| `TIMEOUT_SEC` | Serial silence before safe fallback (default 8) |
+| `PWM_IDLE` / `PWM_MIN` | Offline / clamp floor |
+| `PWM_SAFE_FALLBACK` | Crash / silence / takeover |
+| `HEAT_SOAK_*` | Post-load residual cooling |
+| `BIOS_FALLBACK_TIMEOUT` | Seconds offline before `pwm_enable=2` |
+| `HYSTERESIS_THRESHOLD` / `MIN_INTERVAL` | Anti-chatter + 1 Hz hardware write floor |
+
+### Guest (`gpu-fan-guest.sh`)
+| Knob | Role |
+|---|---|
+| `SERIAL` | Usually `/dev/ttyS0` |
+| `INTERVAL_SEC` | Heartbeat (keep well under host `TIMEOUT_SEC`) |
+| `GPU_T` / `GPU_P` | Die temperature curve |
+| `MEM_T` / `MEM_P` | Used only if memory °C exists |
+| `RISE_GAIN` / `UTIL_LEAD` / `POWER_LEAD_*` | Predictive boost |
+| `UP_STEP` / `DOWN_STEP` | Audible smoothness |
+| `CRIT_GPU_C` / `PWM_EMERGENCY` | Path to host VM stop |
+
+---
+
+## 🐛 Common pitfalls
+
+| Symptom | Likely cause |
+|---|---|
+| `IT8689` / pwm not found | `it87` not loaded, or missing `ignore_resource_conflict=1` in **modprobe.d** |
+| Fan flaps between two speeds | BIOS still on a smart curve for the **same** header, or wrong `FAN_HEADER` |
+| Host stuck at 180 | Guest not heartbeating, bad `ttyS0`, or `qm terminal` stole serial0 |
+| Guest write fails | VM has no `serial0: socket`, or wrong device node |
+| `nc: invalid option -U` | Install **`netcat-openbsd`** (not traditional netcat only) |
+| Memory temp always `-` | Normal on many P40 + 535 setups — die curve alone is enough |
+| Server crashed after enable | **Wrong header** / dual control race — fix `FAN_HEADER`, set flat BIOS %, one writer only |
+
+---
+
+## 📁 Repo layout (suggested)
+
 ```text
-integro systemd: Started Proxmox Host SYS_FAN GPU Controller.
-integro gpu-fan-controller.sh: === SYS_FAN init (header 2) ===
-integro gpu-fan-controller.sh: Hardware at /sys/class/hwmon/hwmon3
-integro gpu-fan-controller.sh: VM 126 up -> manual control
-integro gpu-fan-controller.sh: PWM 40 | 1180 RPM | ACTIVE
+.
+├── README.md
+├── host/
+│   └── gpu-fan-controller.sh
+└── guest/
+    └── gpu-fan-guest.sh
 ```
 
-### Phase 4: Dynamic Hardware Control Verification Loop (Forced Ramping)
-To check if the blower fan physically scales up and down, force a high PWM signal through the VM:
+Copy each script to `/usr/local/bin/` on the matching machine as shown above.
 
-1. Inside the Guest VM, modify the script variables to temporarily simulate a heavy minimum state:
-   ```bash
-   sudo sed -i 's/PWM_MIN=40/PWM_MIN=160/g' /usr/local/bin/gpu-fan-guest.sh
-   sudo systemctl restart gpu-fan-guest.service
-   ```
-2. **Acoustic and Visual Validation:** The physical Delta blower fan will instantly ramp up, registering $\approx 3600\text{ RPM}$ inside your active Proxmox `journalctl -f` shell.
-3. Revert your configuration profile once verification concludes:
-   ```bash
-   sudo sed -i 's/PWM_MIN=160/PWM_MIN=40/g' /usr/local/bin/gpu-fan-guest.sh
-   sudo systemctl restart gpu-fan-guest.service
-   ```
-4. Heat-Soak Verification: Notice that the fan continues to run high for precisely 25 seconds after reverting. This confirms that the host-side HEAT_SOAK protective layer is working exactly as intended to shed residual core heat.
+---
 
+## 📄 License
 
-📄 LicenseThis system tool assembly is distributed under open-source protocols matching standard GPL-2.0 conditions matching parent module drivers.
-***
-<FollowUp>
-Nu de **README.md** helemaal strak op GitHub kan worden geplaatst, laat maar weten:
-* Of je de **volledige broncode** van beide definitieve bestanden nog in één overzicht wilt zien om ze makkelijk te kunnen uploaden naar je repository.
-* Of je hulp nodig hebt bij het initialiseren van de **Git repository** vanaf de commandline.
-</FollowUp>
+GPL-2.0-style usage is fine for this tooling (same family as much of the kernel/DKMS stack you load beside it).  
+No warranty. Full responsibility for hardware, wiring, power inject, and thermal outcome is yours.
+
+---
+
+## 🙏 Notes
+
+- Written for **my** Ryzen + Gigabyte + Proxmox + Debian 12 + Tesla P40 + BFB1012EH path.  
+- “Works on my machine” was earned the hard way (host IPC, heat-soak, BIOS fallback, guest curve).  
+- If you publish a fork that survives another board or GPU, you are doing future strangers a favour — this repo itself may never track those variants.
