@@ -542,7 +542,12 @@ main_loop() {
 }
 
 # -------------------- Entry --------------------
-if command -v nc.openbsd >/dev/null 2>&1; then
+# Robust binary resolution: Prioritize explicit absolute paths to bypass systemd minimal PATH restrictions
+if [[ -f "/bin/nc.openbsd" ]]; then
+    NC_BIN="/bin/nc.openbsd"
+elif [[ -f "/usr/bin/nc.openbsd" ]]; then
+    NC_BIN="/usr/bin/nc.openbsd"
+elif command -v nc.openbsd >/dev/null 2>&1; then
     NC_BIN=$(command -v nc.openbsd)
 elif command -v nc >/dev/null 2>&1; then
     NC_BIN=$(command -v nc)
@@ -552,6 +557,7 @@ elif command -v nc >/dev/null 2>&1; then
 else
     die "nc not found — apt install netcat-openbsd"
 fi
+
 
 bootstrap_hardware
 read_mono
